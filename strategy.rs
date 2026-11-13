@@ -17,6 +17,7 @@ pub struct Config {
     pub stake_c: f64,
     pub c_min: f64,
     pub funding_rate: f64,
+    pub fee_rate: f64,
     pub max_bid_ask_spread: f64,
     pub price_impact: f64,
     pub parallel_orders_per_market: usize,
@@ -44,6 +45,7 @@ impl Default for Config {
             stake_c: 1.0,
             c_min: 1.0,
             funding_rate: 0.000_015,
+            fee_rate: 0.07,
             max_bid_ask_spread: 0.06,
             price_impact: 0.01,
             parallel_orders_per_market: 2,
@@ -108,6 +110,7 @@ impl Book {
 pub struct Bet {
     pub n: f64,
     pub entry_ask: f64,
+    pub fee: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +139,7 @@ pub struct Pnl {
     pub market_usd: f64,
     pub hedge_usd: f64,
     pub funding_usd: f64,
+    pub fees_usd: f64,
     pub total_usd: f64,
     pub total_pct: f64,
 }
@@ -200,7 +204,45 @@ pub struct HedgeLeg {
     pub funding_rate: f64,
 }
 
-pub fn compute_pnl(bets: &[Bet], hedge: &HedgeLeg, btc: f64, bid: f64, stake_c: f64) -> Pnl {
+pub fn taker_fee(shares: f64, price: f64, fee_rate: f64) -> f64 {
+    let fee = shares * fee_rate * price * (1.0 - price);
+    if !fee.is_finite() || fee <= 0.0 {
+        return 0.0;
+    }
+    (fee * 1e5).round() / 1e5
+}
+
+pub fn compute_pnl(
+    bets: &[Bet],
+    hedge: &HedgeLeg,
+    btc: f64,
+    bid: f64,
+    stake_c: f64,
+    fee_rate: f64,
+) -> Pnl {
+    pnl_at(bets, hedge, btc, bid, stake_c, fee_rate)
+}
+
+pub fn settlement_pnl(cfg: &Config, pos: &Position, btc: f64, yes_won: bool) -> Pnl {
+    let hedge = HedgeLeg {
+        btc_entry: pos.btc_entry,
+        q: pos.q,
+        funding_hours: pos.funding_hours,
+        funding_rate: cfg.funding_rate,
+    };
+    let payout = if yes_won { 1.0 } else { 0.0 };
+    let pnl = pnl_at(&pos.bets, &hedge, btc, payout, cfg.stake_c, 0.0);
+    lock_hedge(cfg, pos, pnl)
+}
+
+fn pnl_at(
+    bets: &[Bet],
+    hedge: &HedgeLeg,
+    btc: f64,
+    price: f64,
+    stake_c: f64,
+    exit_fee_rate: f64,
+) -> Pnl {
     let HedgeLeg {
         btc_entry,
         q,
@@ -210,7 +252,11 @@ pub fn compute_pnl(bets: &[Bet], hedge: &HedgeLeg, btc: f64, bid: f64, stake_c: 
     if !q.is_finite() || q <= 0.0 || !btc.is_finite() || btc <= 0.0 {
         return Pnl::default();
     }
-    let market_usd: f64 = bets.iter().map(|b| b.n * (bid - b.entry_ask)).sum();
+    let shares: f64 = bets.iter().map(|b| b.n).sum();
+    let entry_fees: f64 = bets.iter().map(|b| b.fee).sum();
+    let fees_usd = entry_fees + taker_fee(shares, price, exit_fee_rate);
+    let gross_usd: f64 = bets.iter().map(|b| b.n * (price - b.entry_ask)).sum();
+    let market_usd = gross_usd - fees_usd;
     let funding_usd = q * funding_hours as f64 * funding_rate * btc;
     let hedge_usd = -q * (btc - btc_entry) - funding_usd;
     let total_usd = market_usd + hedge_usd;
@@ -224,6 +270,7 @@ pub fn compute_pnl(bets: &[Bet], hedge: &HedgeLeg, btc: f64, bid: f64, stake_c: 
         market_usd,
         hedge_usd,
         funding_usd,
+        fees_usd,
         total_usd,
         total_pct,
     }
@@ -236,7 +283,11 @@ pub fn position_pnl(cfg: &Config, pos: &Position, btc: f64, bid: f64) -> Pnl {
         funding_hours: pos.funding_hours,
         funding_rate: cfg.funding_rate,
     };
-    let mut pnl = compute_pnl(&pos.bets, &hedge, btc, bid, cfg.stake_c);
+    let pnl = compute_pnl(&pos.bets, &hedge, btc, bid, cfg.stake_c, cfg.fee_rate);
+    lock_hedge(cfg, pos, pnl)
+}
+
+fn lock_hedge(cfg: &Config, pos: &Position, mut pnl: Pnl) -> Pnl {
     if pos.hedge_closed {
         pnl.hedge_usd = pos.hedge_pnl_locked;
         pnl.funding_usd = 0.0;
@@ -308,7 +359,8 @@ pub fn evaluate_entry(
     }
 
     let n = cfg.stake_c / best_ask;
-    let pi = n - cfg.stake_c;
+    let fee = taker_fee(n, best_ask, cfg.fee_rate);
+    let pi = n - cfg.stake_c - fee;
     let q = cfg.stake_c / d;
     let dist_cond_sl = pi / q;
     if dist_cond_sl < cfg.dist_cond_sl_min {
@@ -327,6 +379,7 @@ pub fn evaluate_entry(
         bets: vec![Bet {
             n,
             entry_ask: best_ask,
+            fee,
         }],
         conditional_sl: btc + dist_cond_sl,
         stop_loss: None,
@@ -418,12 +471,15 @@ pub fn evaluate_position(
     };
 
     let n_new = cfg.stake_c / ask;
+    let fee_new = taker_fee(n_new, ask, cfg.fee_rate);
     let n_total: f64 = pos.bets.iter().map(|b| b.n).sum::<f64>() + n_new;
+    let fees_total: f64 = pos.bets.iter().map(|b| b.fee).sum::<f64>() + fee_new;
     let c_total = (pos.bets.len() + 1) as f64 * cfg.stake_c;
-    let stop_loss = pos.btc_entry + (n_total - c_total) / pos.q;
+    let stop_loss = pos.btc_entry + (n_total - c_total - fees_total) / pos.q;
     let bet = Bet {
         n: n_new,
         entry_ask: ask,
+        fee: fee_new,
     };
 
     if btc >= stop_loss {
@@ -513,9 +569,59 @@ mod tests {
         }
     }
 
+    fn fee_free() -> Config {
+        Config {
+            fee_rate: 0.0,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn taker_fee_follows_the_published_curve() {
+        assert!((taker_fee(100.0, 0.50, 0.07) - 1.75).abs() < 1e-9);
+        assert!((taker_fee(100.0, 0.30, 0.07) - taker_fee(100.0, 0.70, 0.07)).abs() < 1e-9);
+        assert!((taker_fee(1.0, 0.999, 0.07) - 0.00007).abs() < 1e-12);
+        assert_eq!(taker_fee(0.01, 0.999, 0.07), 0.0);
+        assert_eq!(taker_fee(100.0, 0.50, 0.0), 0.0);
+    }
+
+    #[test]
+    fn entry_fee_shrinks_the_conditional_sl_distance() {
+        let m = market(79_000.0, 24 * SECS_PER_HOUR);
+        let b = book(0.59, 0.60, 500.0);
+        let free = evaluate_entry(&fee_free(), &m, 80_000.0, &b, 0, 0, &[]).unwrap();
+        let paid = evaluate_entry(&Config::default(), &m, 80_000.0, &b, 0, 0, &[]).unwrap();
+        assert!((paid.bets[0].fee - 0.028).abs() < 1e-9);
+        let expected = free.conditional_sl - paid.bets[0].fee / paid.q;
+        assert!((paid.conditional_sl - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mark_to_market_nets_entry_and_exit_fees() {
+        let cfg = Config::default();
+        let m = market(79_000.0, 24 * SECS_PER_HOUR);
+        let pos = evaluate_entry(&cfg, &m, 80_000.0, &book(0.59, 0.60, 500.0), 0, 0, &[]).unwrap();
+        let pnl = position_pnl(&cfg, &pos, 80_000.0, 0.60);
+        let exit_fee = taker_fee(pos.bets[0].n, 0.60, cfg.fee_rate);
+        assert!((pnl.fees_usd - (pos.bets[0].fee + exit_fee)).abs() < 1e-9);
+        assert!((pnl.total_usd + pnl.fees_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn settlement_charges_no_exit_fee() {
+        let cfg = Config::default();
+        let m = market(79_000.0, 24 * SECS_PER_HOUR);
+        let pos = evaluate_entry(&cfg, &m, 80_000.0, &book(0.59, 0.60, 500.0), 0, 0, &[]).unwrap();
+        let won = settlement_pnl(&cfg, &pos, 80_000.0, true);
+        assert!((won.fees_usd - pos.bets[0].fee).abs() < 1e-9);
+        assert!((won.market_usd - (pos.bets[0].n - cfg.stake_c - pos.bets[0].fee)).abs() < 1e-9);
+        let lost = settlement_pnl(&cfg, &pos, 80_000.0, false);
+        assert!((lost.market_usd + cfg.stake_c + pos.bets[0].fee).abs() < 1e-9);
+    }
+
     #[test]
     fn entry_sets_conditional_sl_from_distance_and_ask() {
-        let cfg = Config::default();
+        let cfg = fee_free();
         let now = 0;
         let m = market(79_000.0, 24 * SECS_PER_HOUR);
         let pos =
@@ -583,11 +689,13 @@ mod tests {
             &[Bet {
                 n: 1.0,
                 entry_ask: 0.5,
+                fee: 0.0,
             }],
             &hedge,
             80_000.0,
             0.6,
             1.0,
+            0.07,
         );
         assert_eq!(p, Pnl::default());
     }

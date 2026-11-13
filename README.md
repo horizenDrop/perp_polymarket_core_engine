@@ -49,21 +49,29 @@ Checks 1 to 3 read counts and timestamps that the **caller** supplies, so what c
 ## Formulas
 
 ```text
+fee(n, p) = round5(n · fee_rate · p · (1 − p))   Polymarket taker fee, USDC
+
 n        = C / ask                        YES tokens bought
-pi       = n − C                          maximum profit on the YES leg
+pi       = n − C − fee(n, ask)            maximum profit on the YES leg, net of the entry fee
 Q        = C / D                          hedge size in BTC
-dist_csl = pi / Q = D · (1 − ask) / ask   distance from entry to the Phase-2 trigger
+dist_csl = pi / Q = D · (1 − ask) · (1/ask − fee_rate)   distance to the Phase-2 trigger
 
 conditional_sl = BTC_entry + dist_csl
-stop_loss      = BTC_entry + (n_total − c_total) / Q
+stop_loss      = BTC_entry + (n_total − c_total − fees_total) / Q
 
-market_pnl = Σ nᵢ · (bid − askᵢ)
+market_pnl = Σ nᵢ · (bid − askᵢ) − Σ feeᵢ − fee(n_total, bid)
 hedge_pnl  = −Q · (BTC − BTC_entry) − Q · hours · funding_rate · BTC
 total_pnl  = market_pnl + hedge_pnl
 total_pct  = total_pnl / c_total · 100
 ```
 
 `conditional_sl` is the BTC price at which the hedge loss exactly cancels the best case on the YES leg. It is an accounting identity, not a risk budget.
+
+## Fees
+
+Since 2026 Polymarket charges takers `shares · fee_rate · p · (1 − p)` USDC on every fill in fee-enabled categories, rounded to 5 decimals. The rate for Crypto markets is `0.07`, which peaks at $1.75 per 100 shares at `p = 0.50`. Makers pay nothing and receive 20% of the taker fees collected in their market as a daily rebate. Redeeming a resolved market is not a trade and carries no fee.
+
+Every leg of this strategy is a taker order, so the module charges the fee on each buy and, in mark-to-market PnL, on selling the whole YES leg at the bid. `position_pnl` is therefore a liquidation value, and the take-profit and break-even exits fire on net numbers. At expiry use `settlement_pnl`, which pays out $1 or $0 per token with no exit fee. Set `fee_rate` to `0.0` for a fee-free market or to reproduce the pre-fee model.
 
 ## Position lifecycle
 
@@ -121,6 +129,7 @@ Rows 15 and 16 are the single-tick case: BTC clears `conditional_sl` and the fre
 | `stake_c` | `1.0` | Stake per bet, USD |
 | `c_min` | `1.0` | Minimum fill inside the price-impact window |
 | `funding_rate` | `0.000015` | Perp funding per hour, as a fraction |
+| `fee_rate` | `0.07` | Polymarket taker fee rate (Crypto category); `0.0` disables fees |
 | `max_bid_ask_spread` | `0.06` | Maximum YES spread |
 | `price_impact` | `0.01` | Asks counted only up to `best_ask + this` |
 | `parallel_orders_per_market` | `2` | Open positions per market |
@@ -148,11 +157,19 @@ loop {
     apply(&mut position, &action, now_ts);
 
     if let Action::Close(reason) = action {
-        settle(&position, reason);
+        let pnl = match reason {
+            CloseReason::MarketExpiry if now_ts >= position.expiry_ts => {
+                settlement_pnl(&cfg, &position, btc, btc > position.strike_k)
+            }
+            _ => position_pnl(&cfg, &position, btc, bid),
+        };
+        settle(&position, reason, pnl);
         break;
     }
 }
 ```
+
+`MarketExpiry` is also returned by the tracking-mode timeout, which is a sale at the bid and not a settlement, hence the expiry check above.
 
 You supply the BTC price, the market list, order books, and a clock in Unix seconds. `evaluate_position` expects to run on a short interval; the original ran it every 3 seconds.
 
@@ -162,7 +179,7 @@ PnL can also be computed without a `Position`, by describing the hedge directly:
 
 ```rust
 let hedge = HedgeLeg { btc_entry, q, funding_hours, funding_rate };
-let pnl = compute_pnl(&bets, &hedge, btc, bid, stake_c);
+let pnl = compute_pnl(&bets, &hedge, btc, bid, stake_c, fee_rate);
 ```
 
 There is no `Cargo.toml` on purpose. Drop the file into an existing crate as a module, or build it standalone:
@@ -172,7 +189,7 @@ rustc --edition 2021 --crate-type lib strategy.rs
 rustc --edition 2021 --test strategy.rs -o strategy_tests && ./strategy_tests
 ```
 
-Verified on rustc 1.98.1: builds with no warnings, `clippy::all` clean, 7 unit tests covering entry sizing, the rejection ladder, the Phase-2 transition, the hedge-only stop and tracking exits.
+Verified on rustc 1.100.0: builds with no warnings, `clippy::all` clean, `rustfmt --check` clean, 11 unit tests covering entry sizing, the rejection ladder, the Phase-2 transition, the hedge-only stop, tracking exits, the fee curve, the fee-adjusted trigger, net mark-to-market and settlement.
 
 ## Results
 
@@ -191,6 +208,10 @@ Unless stated otherwise, simulations model BTC as a driftless geometric Brownian
 **There is no edge term anywhere.** Nothing in the module computes a fair probability; the only cheapness test is `ask <= 0.80`. Over 20,000 paths the strategy returns `−$0.075` per trade, and `+$0.004` with all costs zeroed. The structure is a fair game and the entire loss is the round-trip spread. Breaking even needs about 3 cents of genuine mispricing per bet, which is what `−$0.0003` per trade at a 3-cent edge works out to.
 
 **The position is short volatility, and on the wrong side of it.** Buying an in-the-money binary and hedging it is a short-vol trade: negative gamma, negative vega, high win rate, fat left tail. Measured on 2026-09-20 with BTC at $80,857, the only Polymarket expiry inside the 1 to 36 hour window priced at 19.2% implied volatility, and the next one out, at 37.3 hours, at 27.3%. BTC realized 20.7% over the preceding 24 hours and between 34.6% and 38.6% on every lookback from 7 to 90 days. Each expiry also showed a smile, 26% to 31% near the money against 32% to 39% in the wings, and the `ask <= 0.80` filter lands near its bottom. That is a single snapshot taken on an unusually calm day and is not a statistical result on its own, but the sign of the gap is not marginal.
+
+**Taker fees roughly double the loss.** The numbers above predate Polymarket's taker fee. A re-run with the fee modelled (20,000 driftless paths, 50% volatility, fair-value quotes with a 2-cent spread, 2-minute steps) moved mean PnL per trade from `−$0.054` to `−$0.114` with BTC at $100,000 on a 24-hour expiry, and from `−$0.058` to `−$0.110` at $69,000 on 36 hours. Fees average `$0.055` per trade, because a position that reaches Phase 2 pays the fee on two buys and on the sale. The entry mispricing needed to break even rises from about 4 cents to about 8 cents per share. Without Phase 2 the loss is `−$0.037` before fees and `−$0.075` after.
+
+**The dollar thresholds no longer fit the price.** `dist_csl` cannot exceed roughly `0.22` standard deviations of the horizon. With BTC at $69,000, 50% volatility and a 24-hour expiry that ceiling is about $395 at the ask and $375 once the entry fee is netted out, below `dist_cond_sl_min = 400`, so no market can pass the entry filter at all. It reopens only with more volatility or a longer horizon: $461 at 36 hours.
 
 **A win rate is a dial, not an edge.** Any barrier structure can be tuned to any win rate by moving the barriers. Expectancy and the shape of the tail are the numbers that decide.
 
